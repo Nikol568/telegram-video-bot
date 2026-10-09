@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
+MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))
 
 
 class VideoProcessingError(Exception):
@@ -14,15 +15,15 @@ class VideoProcessingError(Exception):
 PROFILES = {
     "fast": {
         "crf": "28",
-        "preset": "veryfast",
+        "preset": "ultrafast",
     },
     "balanced": {
         "crf": "23",
-        "preset": "medium",
+        "preset": "veryfast",
     },
     "quality": {
-        "crf": "18",
-        "preset": "slow",
+        "crf": "20",
+        "preset": "fast",
     },
 }
 
@@ -42,16 +43,34 @@ async def run_command(command, timeout=300):
 
     except asyncio.TimeoutError as exc:
         raise VideoProcessingError(
-            "Обработка заняла слишком много времени."
+            "Обработка заняла больше 300 секунд. "
+            "Попробуй режим «Быстрый» или более короткое видео."
+        ) from exc
+
+    except FileNotFoundError as exc:
+        raise VideoProcessingError(
+            "FFmpeg не найден на сервере. "
+            "Проверь настройки Dockerfile."
         ) from exc
 
     if process.returncode != 0:
-        details = stderr.decode(
+        error_text = stderr.decode(
             "utf-8", errors="replace"
-        )[-1500:]
+        )
+
+        # Показываем самые важные последние строки ошибки.
+        error_lines = [
+            line.strip()
+            for line in error_text.splitlines()
+            if line.strip()
+        ]
+        details = "\n".join(error_lines[-12:])
+
+        if not details:
+            details = "FFmpeg завершился без подробного сообщения."
 
         raise VideoProcessingError(
-            "Ошибка FFmpeg: " + details
+            "Ошибка FFmpeg:\n" + details[-2500:]
         )
 
 
@@ -64,17 +83,32 @@ async def get_duration(input_path):
         str(input_path),
     ]
 
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-    stdout, stderr = await process.communicate()
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(),
+            timeout=30,
+        )
+
+    except asyncio.TimeoutError as exc:
+        raise VideoProcessingError(
+            "Не удалось быстро прочитать длительность видео."
+        ) from exc
+
+    except FileNotFoundError as exc:
+        raise VideoProcessingError(
+            "FFprobe не найден на сервере. Проверь Dockerfile."
+        ) from exc
 
     if process.returncode != 0:
         raise VideoProcessingError(
-            "Не удалось определить длительность видео."
+            "Не удалось определить длительность видео. "
+            "Возможно, файл повреждён."
         )
 
     try:
@@ -111,19 +145,22 @@ async def process_video(
 
     duration = await get_duration(input_path)
 
-    max_duration = int(
-        os.getenv("MAX_DURATION_SEC", "600")
-    )
-
-    if duration > max_duration:
+    if duration <= 0:
         raise VideoProcessingError(
-            f"Видео длиннее лимита {max_duration} секунд."
+            "Длительность видео некорректна."
+        )
+
+    if duration > MAX_DURATION_SEC:
+        raise VideoProcessingError(
+            f"Видео длиннее лимита {MAX_DURATION_SEC} секунд."
         )
 
     settings = PROFILES[profile]
 
     command = [
         "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
         "-y",
         "-i", str(input_path),
         "-map", "0:v:0",
@@ -152,10 +189,12 @@ async def process_video(
                 "Выходной видеофайл пустой."
             )
 
-        if output_path.stat().st_size > MAX_FILE_MB * 1024 * 1024:
-            output_path.unlink(missing_ok=True)
+        max_size_bytes = MAX_FILE_MB * 1024 * 1024
+
+        if output_path.stat().st_size > max_size_bytes:
             raise VideoProcessingError(
-                f"Готовое видео превышает лимит {MAX_FILE_MB} МБ."
+                f"Готовое видео превышает лимит {MAX_FILE_MB} МБ. "
+                "Попробуй режим «Быстрый»."
             )
 
         return output_path
