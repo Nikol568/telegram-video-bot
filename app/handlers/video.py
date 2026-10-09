@@ -9,6 +9,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -125,26 +126,54 @@ async def choose_profile(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.clear()
-    await process_link(callback.message, url, profile)
+
+    # Передаём исходное сообщение пользователя, а не сообщение бота.
+    # Так задание будет записано на правильный Telegram ID.
+    await process_link(
+        callback.message,
+        url,
+        profile,
+        user_id=callback.from_user.id,
+    )
 
 
-async def process_link(message: Message, url: str, profile: str):
-    user = message.from_user
-    if not user:
+async def process_link(
+    message: Message,
+    url: str,
+    profile: str,
+    user_id: int | None = None,
+):
+    if user_id is None:
+        user_id = (
+            message.from_user.id
+            if message.from_user
+            else None
+        )
+
+    if user_id is None:
+        await message.answer("Не удалось определить пользователя.")
         return
 
-    job_id = await create_job(user.id, url)
+    job_id = await create_job(user_id, url)
     status_message = await message.answer("⏳ Получаю видео...")
 
     temp_dir = Path(tempfile.mkdtemp(prefix="video_bot_"))
 
     try:
-        input_path = await download_video(url, temp_dir / "input")
+        input_path = await download_video(
+            url,
+            temp_dir / "input",
+        )
 
         await status_message.edit_text("🎬 Обрабатываю видео...")
 
         output_path = temp_dir / "processed.mp4"
-        await process_video(input_path, output_path, profile)
+
+        await process_video(
+            input_path,
+            output_path,
+            profile,
+        )
 
         metadata_path = await set_video_metadata(
             output_path,
@@ -152,8 +181,20 @@ async def process_link(message: Message, url: str, profile: str):
             comment="Processed using FFmpeg",
         )
 
+        if not metadata_path.is_file():
+            raise RuntimeError(
+                "Готовый видеофайл не найден перед отправкой."
+            )
+
+        await status_message.edit_text("📤 Отправляю готовое видео...")
+
+        video_file = FSInputFile(
+            str(metadata_path),
+            filename="processed.mp4",
+        )
+
         await message.answer_video(
-            video=metadata_path,
+            video=video_file,
             caption=f"✅ Готово! Профиль: {PROFILES[profile]}",
         )
 
@@ -164,14 +205,22 @@ async def process_link(message: Message, url: str, profile: str):
         logger.exception("Video processing failed")
 
         try:
-            await finish_job(job_id, "failed", str(exc)[:500])
+            await finish_job(
+                job_id,
+                "failed",
+                str(exc)[:500],
+            )
         except Exception:
             logger.exception("Could not update job status")
 
-        reason = str(exc)[:500] or "Неизвестная ошибка."
-        await status_message.edit_text(
-            f"❌ Не удалось обработать видео.\nПричина: {reason}"
-        )
+        reason = str(exc)[:1000] or "Неизвестная ошибка."
+
+        try:
+            await status_message.edit_text(
+                f"❌ Не удалось обработать видео.\nПричина: {reason}"
+            )
+        except Exception:
+            logger.exception("Could not update status message")
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
