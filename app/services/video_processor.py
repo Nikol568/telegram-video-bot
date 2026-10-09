@@ -7,6 +7,8 @@ from pathlib import Path
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))
 
+FFMPEG_THREADS = int(os.getenv("FFMPEG_THREADS", "2"))
+
 
 class VideoProcessingError(Exception):
     pass
@@ -29,10 +31,12 @@ PROFILES = {
 
 
 async def run_command(command, timeout=300):
+    process = None
+
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
 
@@ -42,6 +46,10 @@ async def run_command(command, timeout=300):
         )
 
     except asyncio.TimeoutError as exc:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+
         raise VideoProcessingError(
             "Обработка заняла больше 300 секунд. "
             "Попробуй режим «Быстрый» или более короткое видео."
@@ -49,28 +57,28 @@ async def run_command(command, timeout=300):
 
     except FileNotFoundError as exc:
         raise VideoProcessingError(
-            "FFmpeg не найден на сервере. "
-            "Проверь настройки Dockerfile."
+            "FFmpeg или FFprobe не найден на сервере. "
+            "Проверь Dockerfile."
         ) from exc
 
     if process.returncode != 0:
-        error_text = stderr.decode(
-            "utf-8", errors="replace"
-        )
-
-        # Показываем самые важные последние строки ошибки.
-        error_lines = [
+        error_text = stderr.decode("utf-8", errors="replace")
+        lines = [
             line.strip()
             for line in error_text.splitlines()
             if line.strip()
         ]
-        details = "\n".join(error_lines[-12:])
+        details = "\n".join(lines[-20:])
 
         if not details:
-            details = "FFmpeg завершился без подробного сообщения."
+            details = (
+                f"FFmpeg завершился с кодом {process.returncode}, "
+                "но не сообщил подробную ошибку."
+            )
 
         raise VideoProcessingError(
-            "Ошибка FFmpeg:\n" + details[-2500:]
+            f"Ошибка FFmpeg (код {process.returncode}):\n"
+            f"{details[-3500:]}"
         )
 
 
@@ -90,25 +98,30 @@ async def get_duration(input_path):
             stderr=asyncio.subprocess.PIPE,
         )
 
-        stdout, _ = await asyncio.wait_for(
+        stdout, stderr = await asyncio.wait_for(
             process.communicate(),
             timeout=30,
         )
 
     except asyncio.TimeoutError as exc:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
         raise VideoProcessingError(
-            "Не удалось быстро прочитать длительность видео."
+            "Не удалось определить длительность видео за 30 секунд."
         ) from exc
 
     except FileNotFoundError as exc:
         raise VideoProcessingError(
-            "FFprobe не найден на сервере. Проверь Dockerfile."
+            "FFprobe не найден. Проверь установку FFmpeg в Dockerfile."
         ) from exc
 
     if process.returncode != 0:
+        details = stderr.decode("utf-8", errors="replace")[-1000:]
         raise VideoProcessingError(
-            "Не удалось определить длительность видео. "
-            "Возможно, файл повреждён."
+            "Не удалось прочитать исходное видео через FFprobe.\n"
+            + details
         )
 
     try:
@@ -116,7 +129,8 @@ async def get_duration(input_path):
         return float(info["format"]["duration"])
     except (ValueError, KeyError, TypeError) as exc:
         raise VideoProcessingError(
-            "Не удалось прочитать информацию о видео."
+            "У видео не удалось определить длительность. "
+            "Файл может быть повреждён или не полностью скачан."
         ) from exc
 
 
@@ -138,10 +152,12 @@ async def process_video(
             "Неизвестный профиль обработки."
         )
 
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if FFMPEG_THREADS < 1:
+        raise VideoProcessingError(
+            "FFMPEG_THREADS должен быть не меньше 1."
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     duration = await get_duration(input_path)
 
@@ -161,11 +177,14 @@ async def process_video(
         "ffmpeg",
         "-hide_banner",
         "-nostdin",
+        "-loglevel", "warning",
         "-y",
+        "-threads", str(FFMPEG_THREADS),
         "-i", str(input_path),
         "-map", "0:v:0",
         "-map", "0:a?",
         "-c:v", "libx264",
+        "-threads", str(FFMPEG_THREADS),
         "-preset", settings["preset"],
         "-crf", settings["crf"],
         "-pix_fmt", "yuv420p",
@@ -177,7 +196,7 @@ async def process_video(
     ]
 
     try:
-        await run_command(command)
+        await run_command(command, timeout=300)
 
         if not output_path.is_file():
             raise VideoProcessingError(
