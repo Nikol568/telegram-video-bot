@@ -1,46 +1,56 @@
 import asyncio
+import logging
 from pathlib import Path
-
-class MetadataError(Exception):
-“”“Ошибка изменения метаданных видео.”””
-
+logger = logging.getLogger(__name__)
 async def set_video_metadata(
-video_path: str | Path,
-title: str | None = None,
-comment: str | None = None,
+    video_path: Path,
+    title: str = "Processed video",
+    comment: str = "Processed using FFmpeg",
 ) -> Path:
-“””
-Записывает поддерживаемые поля title и comment в контейнер MP4.
-Для совместимости использует FFmpeg.
-“””
-source = Path(video_path)
-
-if not source.is_file():
-    raise MetadataError("Видео для изменения метаданных не найдено.")
-output = source.with_name(f"{source.stem}_metadata.mp4")
-command = [
-    "ffmpeg",
-    "-hide_banner",
-    "-loglevel", "error",
-    "-y",
-    "-i", str(source),
-    "-map", "0",
-    "-c", "copy",
-    "-map_metadata", "0",
-]
-if title:
-    command.extend(["-metadata", f"title={title[:200]}"])
-if comment:
-    command.extend(["-metadata", f"comment={comment[:500]}"])
-command.extend(["-movflags", "+faststart", str(output)])
-process = await asyncio.create_subprocess_exec(
-    *command,
-    stdout=asyncio.subprocess.PIPE,
-    stderr=asyncio.subprocess.PIPE,
-)
-_, stderr = await process.communicate()
-if process.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
-    output.unlink(missing_ok=True)
-    error = stderr.decode("utf-8", errors="replace")[-1000:]
-    raise MetadataError(error or "Не удалось записать метаданные.")
-return output
+    """Изменяет метаданные видео через FFmpeg."""
+    video_path = Path(video_path)
+    if not video_path.is_file():
+        raise FileNotFoundError(
+            f"Видео не найдено: {video_path}"
+        )
+    output_path = video_path.with_name(
+        f"{video_path.stem}_metadata.mp4"
+    )
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i", str(video_path),
+        "-map", "0",
+        "-c", "copy",
+        "-metadata", f"title={title}",
+        "-metadata", f"comment={comment}",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=120,
+        )
+        if process.returncode != 0:
+            error = stderr.decode(
+                "utf-8", errors="replace"
+            )[-2000:]
+            raise RuntimeError(
+                f"FFmpeg не смог изменить метаданные: {error}"
+            )
+        if not output_path.is_file():
+            raise RuntimeError(
+                "FFmpeg не создал выходной файл."
+            )
+        return output_path
+    except Exception:
+        if output_path.exists():
+            output_path.unlink(missing_ok=True)
+        logger.exception("Ошибка изменения метаданных")
+        raise
