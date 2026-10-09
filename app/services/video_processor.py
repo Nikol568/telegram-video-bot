@@ -3,10 +3,10 @@ import json
 import os
 from pathlib import Path
 
-MAX_FILE_MB = int(os.getenv(“MAX_FILE_MB”, “45”))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB, "45"))
 
 class VideoProcessingError(Exception):
-“”“Ошибка обработки видео.”””
+"""Ошибка обработки видео."""
 
 async def run_command(*args: str) -> str:
 process = await asyncio.create_subprocess_exec(
